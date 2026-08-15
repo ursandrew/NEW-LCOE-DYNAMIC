@@ -16,7 +16,9 @@ Author: SJ | 2026
 
 import streamlit as st
 import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
+from io import BytesIO
 
 from cost_engine import CostItem, CostCategory, DetailedCostConfig, compute_detailed_capex_opex
 from lcoe_engine import solar_lcoe, wind_lcoe, hybrid_lcoe
@@ -50,6 +52,30 @@ st.markdown("**Detailed CAPEX/OPEX LCOE Sizing: Solar PV + Wind**")
 st.caption("Python replication of Excel-style anchor-point cost workbooks (e.g. Solar_3.xlsm) — "
            "validated to machine precision against the source workbook's own LCOE column")
 st.markdown("---")
+
+
+# ==============================================================================
+# SHARED CHART STYLING — explicit tick/gridline colors so axes stay readable
+# regardless of the surrounding Streamlit theme (light or dark).
+# ==============================================================================
+
+def style_chart(fig, height=400):
+    axis_style = dict(
+        tickfont=dict(size=13, color='#1a1a1a'),
+        title_font=dict(size=14, color='#1a1a1a'),
+        gridcolor='#d5d5d5', zerolinecolor='#b0b0b0',
+        showline=True, linecolor='#333333', linewidth=1,
+    )
+    fig.update_layout(
+        plot_bgcolor='white', paper_bgcolor='white',
+        font=dict(color='#1a1a1a', size=13),
+        xaxis=axis_style, yaxis=axis_style,
+        height=height, margin=dict(t=50, b=40, l=60, r=30),
+    )
+    return fig
+
+
+SJ_PALETTE = ['#FDB462', '#80B1D3', '#8DD3C7', '#FB8072', '#BEBADA']
 
 
 # ==============================================================================
@@ -339,11 +365,13 @@ with tab_results:
                                          for r in search['scan']])
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(x=scan_df['Capacity (MWp)'], y=scan_df['Unmet Load (%)'],
-                                          mode='lines+markers', line=dict(color='#E63946', width=2)))
-                fig.add_hline(y=target_unmet_pct, line_dash='dash', line_color='#1976D2',
-                              annotation_text=f"Target: {target_unmet_pct:.1f}%")
-                fig.update_layout(xaxis_title="Solar Capacity (MWp)", yaxis_title="Unmet Load (%)",
-                                   plot_bgcolor='white', paper_bgcolor='white', font=dict(color='#333333'), height=380)
+                                          mode='lines+markers', line=dict(color='#E63946', width=3),
+                                          marker=dict(size=8, color='#E63946')))
+                fig.add_hline(y=target_unmet_pct, line_dash='dash', line_color='#1976D2', line_width=2,
+                              annotation_text=f"Target: {target_unmet_pct:.1f}%",
+                              annotation_font=dict(size=13, color='#1976D2'))
+                style_chart(fig, height=380)
+                fig.update_layout(xaxis_title="Solar Capacity (MWp)", yaxis_title="Unmet Load (%)")
                 st.plotly_chart(fig, use_container_width=True)
                 st.stop()
 
@@ -402,6 +430,17 @@ with tab_results:
         if s_capex_detail['extrapolated']:
             st.warning("Solar capacity is outside the anchor range — CAPEX/OPEX values are extrapolated (flat beyond range).")
 
+        # Cost breakdown chart
+        cat_labels = list(s_capex_detail['categories'].keys())
+        cat_values_m = [s_capex_detail['categories'][l]['subtotal'] / 1e6 for l in cat_labels]
+        fig_cost = go.Figure(data=[go.Bar(
+            x=cat_labels, y=cat_values_m, marker_color=SJ_PALETTE,
+            text=[f'${v:.2f}M' for v in cat_values_m], textposition='outside')])
+        style_chart(fig_cost, height=380)
+        fig_cost.update_layout(title='Solar CAPEX by Category', xaxis_title='Category',
+                                yaxis_title='Cost ($M)', showlegend=False)
+        st.plotly_chart(fig_cost, use_container_width=True)
+
         if use_profile:
             st.markdown("---")
             st.subheader("📈 Unmet Load vs. Capacity (search scan)")
@@ -409,12 +448,99 @@ with tab_results:
                                      for r in search['scan']])
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=scan_df['Capacity (MWp)'], y=scan_df['Unmet Load (%)'],
-                                      mode='lines+markers', line=dict(color='#E63946', width=2)))
-            fig.add_hline(y=target_unmet_pct, line_dash='dash', line_color='#1976D2',
-                          annotation_text=f"Target: {target_unmet_pct:.1f}%")
-            fig.update_layout(xaxis_title="Solar Capacity (MWp)", yaxis_title="Unmet Load (%)",
-                               plot_bgcolor='white', paper_bgcolor='white', font=dict(color='#333333'), height=380)
+                                      mode='lines+markers', line=dict(color='#E63946', width=3),
+                                      marker=dict(size=8, color='#E63946')))
+            fig.add_hline(y=target_unmet_pct, line_dash='dash', line_color='#1976D2', line_width=2,
+                          annotation_text=f"Target: {target_unmet_pct:.1f}%",
+                          annotation_font=dict(size=13, color='#1976D2'))
+            style_chart(fig, height=380)
+            fig.update_layout(xaxis_title="Solar Capacity (MWp)", yaxis_title="Unmet Load (%)")
             st.plotly_chart(fig, use_container_width=True)
+
+            st.markdown("---")
+            st.subheader("🕐 Representative Day Dispatch")
+            st.caption("A single day picked at the median daily PV output across the year — "
+                       "not the best or worst case, a typical one.")
+            pv_hourly = best_dispatch.hourly_generation_kwh
+            n_days = len(pv_hourly) // 24
+            daily_pv = np.array([pv_hourly[d*24:(d+1)*24].sum() for d in range(n_days)])
+            median_day = int(np.argsort(daily_pv)[len(daily_pv) // 2])
+            start, end = median_day * 24, median_day * 24 + 24
+            hours_of_day = np.arange(24)
+
+            fig_day = go.Figure()
+            fig_day.add_trace(go.Scatter(x=hours_of_day, y=load_kwh[start:end] / 1000,
+                                          name='Load', mode='lines', line=dict(color='#1976D2', width=3)))
+            fig_day.add_trace(go.Scatter(x=hours_of_day, y=pv_hourly[start:end] / 1000,
+                                          name='Solar PV', mode='lines', fill='tozeroy',
+                                          line=dict(color='#FDB462', width=2)))
+            style_chart(fig_day, height=380)
+            fig_day.update_layout(title=f'Representative Day (Day {median_day + 1} of year)',
+                                   xaxis_title='Hour of Day', yaxis_title='Power (MW)',
+                                   legend=dict(font=dict(color='#1a1a1a')))
+            st.plotly_chart(fig_day, use_container_width=True)
+
+        st.markdown("---")
+        st.subheader("📥 Export Results")
+
+        excel_output = BytesIO()
+        with pd.ExcelWriter(excel_output, engine='openpyxl') as writer:
+            summary_rows = [
+                ['Parameter', 'Value'],
+                ['Sizing Mode', 'Profile-based (unmet load target)' if use_profile else 'Excel validation mode'],
+                ['Target Unmet Load (%)', target_unmet_pct if use_profile else ''],
+                ['', ''],
+                ['Solar Discount Rate (%)', solar_discount_pct],
+                ['Solar Inflation Rate (%)', solar_inflation_pct],
+                ['Solar Degradation Rate (%/yr)', solar_degradation_pct],
+                ['Project Lifetime (years)', project_lifetime],
+                ['', ''],
+                ['Optimal Solar Capacity (MWp)', optimal_capacity],
+                ['Annual Energy Year 1 (kWh)', annual_energy_kwh],
+                ['Achieved Unmet Load (%)', unmet_pct_achieved if use_profile else ''],
+                ['Solar LCOE ($/kWh)', s_lcoe.lcoe_per_kwh],
+                ['Solar LCOE ($/MWh)', s_lcoe.lcoe_per_mwh],
+                ['Grand Total CAPEX ($)', s_capex_detail['grand_total_capex']],
+                ['Year-1 OPEX ($)', s_cost['om_annual']],
+            ]
+            pd.DataFrame(summary_rows).to_excel(writer, sheet_name='Summary', index=False, header=False)
+
+            cost_rows = [{'Category': l, 'Subtotal ($)': c['subtotal']}
+                         for l, c in s_capex_detail['categories'].items()]
+            cost_rows += [
+                {'Category': 'Base EPC Cost', 'Subtotal ($)': s_capex_detail['base_epc_cost']},
+                {'Category': 'Grand Total CAPEX', 'Subtotal ($)': s_capex_detail['grand_total_capex']},
+                {'Category': 'Year-1 OPEX', 'Subtotal ($)': s_cost['om_annual']},
+            ]
+            pd.DataFrame(cost_rows).to_excel(writer, sheet_name='Cost_Breakdown', index=False)
+
+            if use_profile:
+                combos_df = pd.DataFrame([{
+                    'Capacity_MWp': r.capacity_mw, 'Unmet_Load_pct': r.unmet_percent,
+                    'Annual_Generation_GWh': r.total_generation_kwh / 1e6,
+                    'Meets_Target': r.unmet_percent <= target_unmet_pct,
+                } for r in search['scan']])
+                combos_df.to_excel(writer, sheet_name='All_Combinations', index=False)
+
+                hourly_df = pd.DataFrame({
+                    'Hour': np.arange(len(load_kwh)),
+                    'Load_kW': load_kwh,
+                    'Solar_PV_kW': best_dispatch.hourly_generation_kwh,
+                    'Unmet_kW': best_dispatch.hourly_unmet_kwh,
+                })
+                hourly_df.to_excel(writer, sheet_name='Year_1_Hourly', index=False)
+
+        excel_output.seek(0)
+        st.download_button(
+            label="📥 Download Full Results (Excel)",
+            data=excel_output,
+            file_name=f"energy_optimizer_pro_solar_{optimal_capacity:.0f}MWp.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        if use_profile:
+            st.caption("Includes every capacity the grid search tried (**All_Combinations**) and the "
+                       "full 8760-hour Year-1 dispatch for the winning capacity (**Year_1_Hourly**) — "
+                       "same structure as the main EMO tool's export.")
     else:
         st.info("Configure Solar cost categories in the tab above, upload Load and PV profiles "
                  "(or switch to validation mode), then click **Run Sizing Search**.")
