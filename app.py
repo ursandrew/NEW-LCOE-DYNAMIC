@@ -245,9 +245,9 @@ with st.sidebar:
 
     load_file = st.file_uploader("Load Profile (CSV, 8760 hrs, value in 2nd column)", type=['csv'])
     pv_file = st.file_uploader("Solar PV Profile (CSV, 8760 hrs, value in 2nd column)", type=['csv'])
-    pv_baseline_mw = st.number_input("PV Profile Reference Capacity (MW)", value=50.0, min_value=0.1, step=5.0,
-                                      help="The capacity the uploaded PV profile represents. Generation scales "
-                                           "linearly from this baseline to any candidate capacity.")
+    st.caption("PV profile convention matches the main EMO tool: 'Output_kW' is a per-1-kW "
+               "normalized specific-yield curve (values ~0-1) — generation scales as "
+               "`profile[h] × capacity_kW` directly. No reference-capacity input needed.")
     target_unmet_pct = st.number_input(
         "Target Unmet Load (%)", value=55.0, min_value=0.0, max_value=100.0, step=1.0,
         help="Solar-only, no BESS: unmet load can never drop below roughly the "
@@ -326,7 +326,7 @@ with tab_results:
                            f"Proceeding, but check the profiles if this wasn't intentional.")
 
             search = find_min_capacity_meeting_target(
-                load_kwh, pv_kwh, pv_baseline_mw, target_unmet_pct,
+                load_kwh, pv_kwh, target_unmet_pct,
                 solar_min, solar_max, solar_step
             )
             if not search['feasible']:
