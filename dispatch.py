@@ -3,8 +3,10 @@ dispatch.py — Profile-based Solar PV sizing via target unmet load %.
 
 Mirrors the main Energy Modeling Optimizer's exact methodology (see
 optimize_gridsearch_hydro_WITH_DEGRADATION.py):
-    - Profiles are hourly generation curves for a reference ("baseline")
-      capacity; scaled to any candidate capacity by a simple ratio.
+    - The 'Output_kW' profile is a per-1-kW normalized specific-yield curve
+      (solar_config['baseline_kw'] = 1.0 in the main tool) — values are
+      output per kW of installed capacity, scaled to any candidate capacity
+      by a direct multiply (capacity_kW * profile[h]), not a baseline ratio.
     - Unmet load per hour = max(0, load - generation).
     - unmet_% = sum(unmet) / sum(load) * 100.
     - A capacity is "feasible" if unmet_% <= target_unmet_%.
@@ -48,15 +50,23 @@ class DispatchResult:
     unmet_percent: float
 
 
-def simulate_solar_only_dispatch(load_profile_kwh: np.ndarray, pv_profile_kwh: np.ndarray,
-                                  pv_baseline_mw: float, candidate_capacity_mw: float) -> DispatchResult:
+def simulate_solar_only_dispatch(load_profile_kwh: np.ndarray, pv_profile_per_kw: np.ndarray,
+                                  candidate_capacity_mw: float) -> DispatchResult:
     """
     Scale the PV profile to candidate_capacity_mw and compute unmet load
-    against the load profile. Solar-only: no wind/hydro/BESS in this dispatch
-    yet, so unmet load is simply max(0, load - pv_generation) each hour.
+    against the load profile. Matches the main EMO tool's exact convention
+    (optimize_gridsearch_hydro_WITH_DEGRADATION.py, solar_config['baseline_kw']
+    = 1.0): the 'Output_kW' profile is a per-1-kW normalized specific-yield
+    curve (values ~0-1, representing output per kW of installed capacity),
+    NOT a full generation curve for some reference-size plant. Scaling is
+    therefore a direct multiply by capacity in kW — no baseline ratio needed,
+    since the baseline is always 1 kW.
+
+    Solar-only: no wind/hydro/BESS in this dispatch yet, so unmet load is
+    simply max(0, load - pv_generation) each hour.
     """
-    scale = candidate_capacity_mw / pv_baseline_mw if pv_baseline_mw else 0.0
-    pv_gen = pv_profile_kwh * scale
+    candidate_capacity_kw = candidate_capacity_mw * 1000
+    pv_gen = pv_profile_per_kw * candidate_capacity_kw
     unmet = np.maximum(0.0, load_profile_kwh - pv_gen)
 
     total_gen = float(pv_gen.sum())
@@ -75,8 +85,8 @@ def simulate_solar_only_dispatch(load_profile_kwh: np.ndarray, pv_profile_kwh: n
     )
 
 
-def find_min_capacity_meeting_target(load_profile_kwh: np.ndarray, pv_profile_kwh: np.ndarray,
-                                      pv_baseline_mw: float, target_unmet_percent: float,
+def find_min_capacity_meeting_target(load_profile_kwh: np.ndarray, pv_profile_per_kw: np.ndarray,
+                                      target_unmet_percent: float,
                                       capacity_min_mw: float, capacity_max_mw: float,
                                       capacity_step_mw: float) -> dict:
     """
@@ -89,7 +99,7 @@ def find_min_capacity_meeting_target(load_profile_kwh: np.ndarray, pv_profile_kw
     scan = []
     best = None
     for cap in candidates_mw:
-        result = simulate_solar_only_dispatch(load_profile_kwh, pv_profile_kwh, pv_baseline_mw, cap)
+        result = simulate_solar_only_dispatch(load_profile_kwh, pv_profile_per_kw, cap)
         scan.append(result)
         if result.unmet_percent <= target_unmet_percent and best is None:
             best = result  # candidates_mw ascending -> first feasible is smallest
