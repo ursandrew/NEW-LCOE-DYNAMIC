@@ -20,6 +20,7 @@ import plotly.graph_objects as go
 
 from cost_engine import CostItem, CostCategory, DetailedCostConfig, compute_detailed_capex_opex
 from lcoe_engine import solar_lcoe, wind_lcoe, hybrid_lcoe
+from dispatch import load_hourly_profile, find_min_capacity_meeting_target
 import excel_loader
 
 
@@ -237,18 +238,41 @@ with st.sidebar:
         wind_degradation_pct = st.number_input("Wind Degradation Rate (%/yr)", value=0.3, min_value=0.0, max_value=5.0, step=0.05)
 
     st.markdown("---")
-    st.subheader("🔎 Sizing Search")
-    st.caption("No hourly dispatch — sizes on annual energy vs. target, matching the Excel workbook's own scope.")
-    target_energy_gwh = st.number_input("Target Annual Energy (GWh/yr)", value=150.0, min_value=1.0, step=10.0)
-    col1, col2 = st.columns(2)
+    st.subheader("🔎 Solar Sizing — Target Unmet Load")
+    st.caption("Same framework as the main EMO tool: profiles scaled by capacity, "
+               "sized to the smallest PV capacity meeting a target unmet-load %. "
+               "Wind sizing will be added once this is validated.")
+
+    load_file = st.file_uploader("Load Profile (CSV, 8760 hrs, value in 2nd column)", type=['csv'])
+    pv_file = st.file_uploader("Solar PV Profile (CSV, 8760 hrs, value in 2nd column)", type=['csv'])
+    pv_baseline_mw = st.number_input("PV Profile Reference Capacity (MW)", value=50.0, min_value=0.1, step=5.0,
+                                      help="The capacity the uploaded PV profile represents. Generation scales "
+                                           "linearly from this baseline to any candidate capacity.")
+    target_unmet_pct = st.number_input(
+        "Target Unmet Load (%)", value=55.0, min_value=0.0, max_value=100.0, step=1.0,
+        help="Solar-only, no BESS: unmet load can never drop below roughly the "
+             "night-time share of annual load, no matter how large the PV plant is "
+             "(zero generation at night is a hard physical floor, not a sizing problem). "
+             "Use a loose target like 50-60% for now to validate the search mechanics. "
+             "Low targets (e.g. 4%) will correctly come back infeasible until BESS/Wind are added."
+    )
+
+    col1, col2, col3 = st.columns(3)
     with col1:
-        solar_min = st.number_input("Solar Min (MWp)", value=50.0, step=5.0)
-        solar_max = st.number_input("Solar Max (MWp)", value=130.0, step=5.0)
-        solar_step = st.number_input("Solar Step (MWp)", value=5.0, step=1.0)
+        solar_min = st.number_input("Solar Search Min (MWp)", value=50.0, step=5.0)
     with col2:
-        wind_min = st.number_input("Wind Min (MW)", value=100.0, step=10.0)
-        wind_max = st.number_input("Wind Max (MW)", value=500.0, step=10.0)
-        wind_step = st.number_input("Wind Step (MW)", value=25.0, step=5.0)
+        solar_max = st.number_input("Solar Search Max (MWp)", value=130.0, step=5.0)
+    with col3:
+        solar_step = st.number_input("Solar Search Step (MWp)", value=5.0, step=1.0)
+
+    st.markdown("---")
+    st.subheader("✅ Cross-Validation vs. Excel")
+    energy_source = st.radio(
+        "Annual energy used in the LCOE calculation:",
+        ["From uploaded PV profile (actual dispatch)", "From Excel anchor interpolation (validation mode)"],
+        help="Use profile-based energy for real sizing work. Switch to Excel anchor mode to reproduce "
+             "Solar_3.xlsm's LCOE exactly at its own anchor capacities, for cross-checking the cost/LCOE math."
+    )
 
 
 # ==============================================================================
@@ -286,100 +310,114 @@ with tab_wind:
 with tab_results:
     if st.button("🚀 Run Sizing Search", type="primary"):
         solar_cfg = st.session_state.solar_cfg
-        wind_cfg = st.session_state.wind_cfg
 
-        solar_caps = [solar_min + i*solar_step for i in range(int((solar_max-solar_min)//solar_step)+1)]
-        wind_caps = [wind_min + i*wind_step for i in range(int((wind_max-wind_min)//wind_step)+1)]
+        use_profile = energy_source.startswith("From uploaded")
 
-        candidates = []
-        for sc in solar_caps:
-            solar_energy_kwh = interp_energy(sc, solar_cfg.anchors_mw, SOLAR_ENERGY_ANCHORS_KWH)
-            for wc in wind_caps:
-                wind_energy_kwh = interp_energy(wc, wind_cfg.anchors_mw, WIND_ENERGY_ANCHORS_KWH)
-                total_gwh = (solar_energy_kwh + wind_energy_kwh) / 1e6
-                if total_gwh >= target_energy_gwh:
-                    candidates.append((sc, wc, solar_energy_kwh, wind_energy_kwh, total_gwh))
+        if use_profile and (load_file is None or pv_file is None):
+            st.error("Upload both a Load Profile and a Solar PV Profile CSV, or switch to "
+                     "'From Excel anchor interpolation' mode to size without profiles.")
+            st.stop()
 
-        if not candidates:
-            st.error("No capacity combination in the search range meets the target energy. Widen the ranges.")
+        if use_profile:
+            load_kwh = load_hourly_profile(load_file)
+            pv_kwh = load_hourly_profile(pv_file)
+            if len(load_kwh) != 8760 or len(pv_kwh) != 8760:
+                st.warning(f"Expected 8760 hourly rows; got Load={len(load_kwh)}, PV={len(pv_kwh)}. "
+                           f"Proceeding, but check the profiles if this wasn't intentional.")
+
+            search = find_min_capacity_meeting_target(
+                load_kwh, pv_kwh, pv_baseline_mw, target_unmet_pct,
+                solar_min, solar_max, solar_step
+            )
+            if not search['feasible']:
+                st.error(f"No capacity up to {solar_max:.0f} MWp meets {target_unmet_pct:.1f}% unmet load.\n\n"
+                         f"For solar-only (no BESS), unmet load plateaus at roughly the night-time share of "
+                         f"annual load — widening the capacity range further usually won't help. Try a "
+                         f"looser target (e.g. 50-60%). The scan below shows where your search plateaued.")
+
+                scan_df = pd.DataFrame([{'Capacity (MWp)': r.capacity_mw, 'Unmet Load (%)': r.unmet_percent}
+                                         for r in search['scan']])
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=scan_df['Capacity (MWp)'], y=scan_df['Unmet Load (%)'],
+                                          mode='lines+markers', line=dict(color='#E63946', width=2)))
+                fig.add_hline(y=target_unmet_pct, line_dash='dash', line_color='#1976D2',
+                              annotation_text=f"Target: {target_unmet_pct:.1f}%")
+                fig.update_layout(xaxis_title="Solar Capacity (MWp)", yaxis_title="Unmet Load (%)",
+                                   plot_bgcolor='white', paper_bgcolor='white', font=dict(color='#333333'), height=380)
+                st.plotly_chart(fig, use_container_width=True)
+                st.stop()
+
+            best_dispatch = search['best']
+            optimal_capacity = best_dispatch.capacity_mw
+            annual_energy_kwh = best_dispatch.total_generation_kwh
+            unmet_pct_achieved = best_dispatch.unmet_percent
         else:
-            results = []
-            for sc, wc, se_kwh, we_kwh, total_gwh in candidates:
-                s_cost = compute_detailed_capex_opex(solar_cfg, sc)
-                w_cost = compute_detailed_capex_opex(wind_cfg, wc)
+            # Validation mode: no dispatch, just pick the smallest anchor capacity
+            # (or let the user pick — for now, default to the smallest anchor point
+            # so results are directly comparable to Excel's first row).
+            optimal_capacity = solar_cfg.anchors_mw[0]
+            annual_energy_kwh = interp_energy(optimal_capacity, solar_cfg.anchors_mw, SOLAR_ENERGY_ANCHORS_KWH)
+            unmet_pct_achieved = None
 
-                s_lcoe = solar_lcoe(s_cost['capital'], s_cost['om_annual'], se_kwh,
-                                     solar_discount_pct/100, solar_inflation_pct/100,
-                                     solar_degradation_pct/100, project_lifetime)
-                w_lcoe = wind_lcoe(w_cost['capital'], w_cost['om_annual'], we_kwh,
-                                    wind_discount_pct/100, wind_inflation_pct/100,
-                                    wind_degradation_pct/100, project_lifetime)
-                h_lcoe = hybrid_lcoe(s_lcoe, w_lcoe)
+        s_cost = compute_detailed_capex_opex(solar_cfg, optimal_capacity)
+        s_lcoe = solar_lcoe(s_cost['capital'], s_cost['om_annual'], annual_energy_kwh,
+                             solar_discount_pct/100, solar_inflation_pct/100,
+                             solar_degradation_pct/100, project_lifetime)
 
-                results.append({
-                    'solar_mwp': sc, 'wind_mw': wc, 'total_gwh': total_gwh,
-                    'solar_capex': s_cost['capital'], 'wind_capex': w_cost['capital'],
-                    'total_npv_cost': h_lcoe.npv_capex + h_lcoe.npv_opex,
-                    'solar_lcoe': s_lcoe.lcoe_per_kwh, 'wind_lcoe': w_lcoe.lcoe_per_kwh,
-                    'hybrid_lcoe': h_lcoe.lcoe_per_kwh,
-                    's_lcoe_obj': s_lcoe, 'w_lcoe_obj': w_lcoe, 'h_lcoe_obj': h_lcoe,
-                    's_cost_detail': s_cost, 'w_cost_detail': w_cost,
-                })
+        if use_profile:
+            st.success(f"Smallest Solar capacity meeting {target_unmet_pct:.1f}% unmet load target: "
+                       f"**{optimal_capacity:.0f} MWp** (achieved {unmet_pct_achieved:.2f}% unmet)")
+        else:
+            st.info(f"Validation mode: showing Solar LCOE at anchor capacity **{optimal_capacity:.0f} MWp** "
+                    f"using the Excel's own anchor-interpolated annual energy.")
 
-            results_df = pd.DataFrame(results)
-            best = results_df.loc[results_df['total_npv_cost'].idxmin()]
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Solar Capacity", f"{optimal_capacity:.0f} MWp")
+        k2.metric("Annual Energy (Year 1)", f"{annual_energy_kwh/1e6:.1f} GWh")
+        k3.metric("Solar LCOE", f"${s_lcoe.lcoe_per_kwh*1000:.2f}/MWh")
 
-            st.success(f"Optimal sizing (min NPV cost meeting {target_energy_gwh:.0f} GWh/yr target): "
-                       f"**Solar {best['solar_mwp']:.0f} MWp + Wind {best['wind_mw']:.0f} MW**")
+        if use_profile:
+            excel_energy_kwh = interp_energy(optimal_capacity, solar_cfg.anchors_mw, SOLAR_ENERGY_ANCHORS_KWH)
+            diff_pct = (annual_energy_kwh - excel_energy_kwh) / excel_energy_kwh * 100 if excel_energy_kwh else 0
+            st.caption(f"📊 For reference: Excel's anchor-interpolated energy at {optimal_capacity:.0f} MWp "
+                       f"would be {excel_energy_kwh/1e6:.1f} GWh ({diff_pct:+.1f}% vs. profile-based). "
+                       f"A large gap usually means the uploaded PV profile's yield differs from the Excel's "
+                       f"generation assumption — worth reconciling before trusting profile-based sizing.")
+        else:
+            st.caption("✅ This LCOE should match Solar_3.xlsm's LCOE column at this exact anchor capacity "
+                       "to within rounding — use this mode to confirm the cost/LCOE math before switching "
+                       "to profile-based sizing.")
 
-            k1, k2, k3, k4 = st.columns(4)
-            k1.metric("Solar LCOE", f"${best['solar_lcoe']*1000:.2f}/MWh")
-            k2.metric("Wind LCOE", f"${best['wind_lcoe']*1000:.2f}/MWh")
-            k3.metric("Hybrid LCOE", f"${best['hybrid_lcoe']*1000:.2f}/MWh")
-            k4.metric("NPV of Cost", f"${best['total_npv_cost']/1e6:.2f}M")
+        st.markdown("---")
+        st.subheader("☀️ Solar Cost Breakdown")
+        s_capex_detail = s_cost['capex_detail']
+        c1, c2 = st.columns(2)
+        with c1:
+            for label, cat in s_capex_detail['categories'].items():
+                st.write(f"**{label}**: ${cat['subtotal']:,.0f}")
+        with c2:
+            st.write(f"**Base EPC Cost**: ${s_capex_detail['base_epc_cost']:,.0f}")
+            st.write(f"**Grand Total CAPEX**: ${s_capex_detail['grand_total_capex']:,.0f}")
+            st.write(f"**Year-1 OPEX**: ${s_cost['om_annual']:,.0f}")
+        if s_capex_detail['extrapolated']:
+            st.warning("Solar capacity is outside the anchor range — CAPEX/OPEX values are extrapolated (flat beyond range).")
 
-            st.caption("✅ Solar LCOE and Wind LCOE use the same growing-annuity NPV formula as "
-                       "Solar_3.xlsm — verify by entering this tool's Solar/Wind capacity at one of "
-                       "the workbook's own anchor points and comparing the LCOE column directly.")
-
+        if use_profile:
             st.markdown("---")
-            c1, c2 = st.columns(2)
-            with c1:
-                st.subheader("☀️ Solar Cost Breakdown")
-                for label, cat in best['s_cost_detail']['categories'].items():
-                    st.write(f"**{label}**: ${cat['subtotal']:,.0f}")
-                st.write(f"**Base EPC Cost**: ${best['s_cost_detail']['base_epc_cost']:,.0f}")
-                st.write(f"**Grand Total CAPEX**: ${best['s_cost_detail']['grand_total_capex']:,.0f}")
-                if best['s_cost_detail']['extrapolated']:
-                    st.warning("Solar capacity is outside the anchor range — values are extrapolated (flat beyond range).")
-            with c2:
-                st.subheader("💨 Wind Cost Breakdown")
-                for label, cat in best['w_cost_detail']['categories'].items():
-                    st.write(f"**{label}**: ${cat['subtotal']:,.0f}")
-                st.write(f"**Base EPC Cost**: ${best['w_cost_detail']['base_epc_cost']:,.0f}")
-                st.write(f"**Grand Total CAPEX**: ${best['w_cost_detail']['grand_total_capex']:,.0f}")
-                if best['w_cost_detail']['extrapolated']:
-                    st.warning("Wind capacity is outside the anchor range — values are extrapolated (flat beyond range).")
-
-            st.markdown("---")
-            st.subheader("📈 LCOE vs. Capacity Mix (all candidates meeting target)")
+            st.subheader("📈 Unmet Load vs. Capacity (search scan)")
+            scan_df = pd.DataFrame([{'Capacity (MWp)': r.capacity_mw, 'Unmet Load (%)': r.unmet_percent}
+                                     for r in search['scan']])
             fig = go.Figure()
-            fig.add_trace(go.Scatter(x=results_df['solar_mwp'], y=results_df['hybrid_lcoe']*1000,
-                                      mode='markers', marker=dict(size=8, color=results_df['wind_mw'],
-                                      colorscale='Viridis', showscale=True, colorbar=dict(title="Wind MW")),
-                                      text=results_df['wind_mw'], name='Hybrid LCOE'))
-            fig.update_layout(xaxis_title="Solar Capacity (MWp)", yaxis_title="Hybrid LCOE ($/MWh)",
-                               plot_bgcolor='white', paper_bgcolor='white', font=dict(color='#333333'), height=420)
+            fig.add_trace(go.Scatter(x=scan_df['Capacity (MWp)'], y=scan_df['Unmet Load (%)'],
+                                      mode='lines+markers', line=dict(color='#E63946', width=2)))
+            fig.add_hline(y=target_unmet_pct, line_dash='dash', line_color='#1976D2',
+                          annotation_text=f"Target: {target_unmet_pct:.1f}%")
+            fig.update_layout(xaxis_title="Solar Capacity (MWp)", yaxis_title="Unmet Load (%)",
+                               plot_bgcolor='white', paper_bgcolor='white', font=dict(color='#333333'), height=380)
             st.plotly_chart(fig, use_container_width=True)
-
-            st.markdown("---")
-            st.subheader("All Candidates")
-            display_df = results_df[['solar_mwp', 'wind_mw', 'total_gwh', 'solar_lcoe', 'wind_lcoe', 'hybrid_lcoe', 'total_npv_cost']].copy()
-            display_df.columns = ['Solar (MWp)', 'Wind (MW)', 'Energy (GWh/yr)', 'Solar LCOE ($/kWh)',
-                                   'Wind LCOE ($/kWh)', 'Hybrid LCOE ($/kWh)', 'NPV of Cost ($)']
-            st.dataframe(display_df.sort_values('NPV of Cost ($)'), use_container_width=True)
     else:
-        st.info("Configure Solar and Wind cost categories in the tabs above, then click **Run Sizing Search**.")
+        st.info("Configure Solar cost categories in the tab above, upload Load and PV profiles "
+                 "(or switch to validation mode), then click **Run Sizing Search**.")
 
 st.markdown("---")
 st.markdown("<p style='text-align:center;color:gray'>Developed by SJ | 2026 | energy-optimizer-pro v1.0</p>",
